@@ -28,7 +28,7 @@ function paynowgg_MetaData()
 {
     return array(
         'DisplayName' => 'PayNow.gg',
-        'Version' => '1.0.4',
+        'Version' => '1.0.5',
         'APIVersion' => '1.1',
         'DisableLocalCreditCardInput' => true,
         'TokenisedStorage' => false,
@@ -128,6 +128,11 @@ function paynowgg_link($params)
 
     if ($amount <= 0) {
         return '<span style="color: red">This invoice does not have a positive balance to pay.</span>';
+    }
+
+    // Renewals are charged automatically by the PayNow subscription; a manual payment would double charge.
+    if (paynowgg_hasActiveSubscription($invoiceId)) {
+        return '<span>This invoice is renewed automatically by your PayNow subscription. No action is required; it will be marked as paid once PayNow charges you.</span>';
     }
 
     try {
@@ -372,6 +377,22 @@ function paynowgg_detectSubscription(array $params, $allowSubscriptions)
         'relid' => (string) $item['relid'],
         'type' => strtolower($item['type']),
     );
+}
+
+function paynowgg_hasActiveSubscription($invoiceId)
+{
+    try {
+        $items = \WHMCS\Database\Capsule::table('tblinvoiceitems')->where('invoiceid', (int) $invoiceId)->get();
+        foreach ($items as $item) {
+            $table = $item->type === 'Hosting' ? 'tblhosting' : ($item->type === 'Addon' ? 'tblhostingaddons' : null);
+            if ($table && (int) $item->relid > 0 && \WHMCS\Database\Capsule::table($table)->where('id', (int) $item->relid)->value('subscriptionid')) {
+                return true;
+            }
+        }
+    } catch (Exception $e) {
+    }
+
+    return false;
 }
 
 function paynowgg_whmcsCycleToPayNowInterval($billingCycle)
