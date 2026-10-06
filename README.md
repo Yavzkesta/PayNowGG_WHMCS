@@ -54,16 +54,42 @@ Subscriptions: how it works
 ---------------------------
 PayNow charges subscription renewals by itself. WHMCS only has to record them, without double billing.
 
-- `ON_ORDER_COMPLETED` is the single source of truth for money (it carries the order id and amounts).
-  - First order of a checkout: pays the WHMCS invoice from the `whmcs_invoice_id` metadata, if it is still unpaid.
-  - Renewal order: finds the WHMCS service through the PayNow subscription id, pays its pending renewal invoice,
-    or creates one (with its line item, linked to the service) when WHMCS has not generated it yet.
-- `ON_SUBSCRIPTION_ACTIVATED` / `ON_SUBSCRIPTION_RENEWED` only link the PayNow subscription id to the service. They never record a payment.
+- `ON_ORDER_COMPLETED` is the only event that books money (it carries the order id and amounts).
+  - Checkout invoice still unpaid: it is paid.
+  - Checkout invoice already paid, order belongs to a subscription linked to a WHMCS service: renewal. The pending
+    renewal invoice of that service is paid, or one is created (with its line item linked to the service).
+  - The invoice lookup must succeed. A failed lookup returns HTTP 500 so PayNow retries; it is never treated as a renewal.
+- `ON_SUBSCRIPTION_ACTIVATED` / `ON_SUBSCRIPTION_RENEWED` only link the subscription to the service, after checking its
+  real status through the PayNow API (a late event for a cancelled subscription is ignored). They never book money.
 - `ON_SUBSCRIPTION_CANCELED` clears the subscription id so the next invoice can be paid normally.
-- An invoice for a service that already has an active PayNow subscription shows "renewed automatically" instead of a pay button, so customers cannot pay twice.
-- The PayNow order id is the WHMCS transaction id. A transaction that already exists is never recorded again, and a lock serialises concurrent webhooks.
-- Recorded payments are capped at the invoice balance, so no credit is added to the client account. On a currency mismatch the invoice balance is used.
-- On processing errors the webhook returns HTTP 500 so PayNow retries; handling is idempotent.
+- An invoice for a service with a PayNow subscription shows "renewed automatically" instead of a pay button.
+- The PayNow order id is the WHMCS transaction id and a single global database lock serialises webhooks. If the lock
+  cannot be obtained the webhook fails (HTTP 500) and PayNow retries.
+- Renewal invoices carry the PayNow order id in their notes, so a retry reuses the invoice instead of creating another.
+
+### What is booked automatically, and what is not
+Anything that cannot be booked safely is **not guessed**. It is written to the WHMCS Activity Log (prefix `PayNow.gg:`)
+and the Gateway Log for manual review:
+
+| Situation | Behaviour |
+| --- | --- |
+| Amount lower than the balance | Booked as a partial payment |
+| Amount higher than the balance | Only the balance is booked; refund the difference in PayNow |
+| Amount 0 with a coupon / gift card | Invoice settled (free order, used by the onboarding test) |
+| Amount 0 without discount, or negative | Not booked |
+| PayNow currency different from the client's WHMCS currency | Not booked |
+| Order for an invoice that is already paid, with no linked subscription | Not booked (possible double charge) |
+| Second subscription for a service that already has a live one | New subscription cancelled through the API, admin alerted |
+| `ON_REFUND` / `ON_CHARGEBACK` | Only reported, never reversed automatically |
+
+### Known limitations
+- Two checkouts opened for the same invoice before the first webhook arrives can still both be paid. The duplicate is
+  detected and cancelled when its webhook arrives, but the customer is charged and must be refunded in PayNow.
+- A renewal is recognised by "paid invoice + subscription linked to a service". PayNow does not give a billing period
+  in the order, so an unexpected extra order on a linked subscription is booked as a renewal.
+- `ON_REFUND` / `ON_CHARGEBACK` do not update WHMCS.
+- Behaviour was validated with simulated WHMCS/PayNow responses, not on a live WHMCS install. Test one subscription end
+  to end with Debug Logging enabled before going to production.
 
 Upgrading from 1.0.4
 --------------------
@@ -72,15 +98,18 @@ Fixes made in 1.0.5 do not repair data created by older versions. Check manually
 - account credit created by payments applied to invoices that were already paid,
 - duplicate PayNow subscriptions on the same service (cancel the extra ones in the PayNow dashboard).
 
-Also add `ON_SUBSCRIPTION_CANCELED` to your PayNow webhook subscriptions.
+Also add `ON_SUBSCRIPTION_CANCELED` to your PayNow webhook subscriptions. The webhook now calls the PayNow API
+(subscription status / cancel), so the API key must be allowed to read and cancel subscriptions.
 
 Changelog
 ---------
-1.0.5 - Fixed duplicate payments, account credit, blank/duplicate renewal invoices and duplicate subscriptions.
-Renewals are now recorded from `ON_ORDER_COMPLETED` (the `ON_SUBSCRIPTION_RENEWED` payload has no amount or order id).
-Added `ON_SUBSCRIPTION_CANCELED` handling, idempotency and locking, payment capped to invoice balance,
-and an "automatic renewal" message instead of a pay button for services with an active subscription.
-
+1.0.5 - Subscription and payment handling rewritten:
+- renewals are booked from `ON_ORDER_COMPLETED` (the `ON_SUBSCRIPTION_RENEWED` payload has no amount or order id);
+- no more guessed amounts: zero/negative amounts and currency mismatches are reported instead of booked;
+- over-payments are capped to the balance and reported;
+- global webhook lock that fails closed, idempotent retries, renewal invoices reused through an order marker;
+- subscription status checked through the API, duplicate subscriptions cancelled, late events ignored;
+- subscription `ON_SUBSCRIPTION_CANCELED` handling and an "automatic renewal" message instead of a pay button.
 1.0.4 - Previous release.
 
 1.0.1 - Added Callback Test and updated README.

@@ -420,7 +420,7 @@ function paynowgg_whmcsCycleToPayNowInterval($billingCycle)
 function paynowgg_apiRequest($apiBaseUrl, $storeId, $apiKey, $method, $path, array $payload = null, $debugMode = false)
 {
     $url = rtrim($apiBaseUrl, '/') . '/v1/stores/' . rawurlencode($storeId) . $path;
-    $jsonPayload = $payload === null ? '' : json_encode($payload);
+    $jsonPayload = $payload === null ? '' : ($payload === array() ? '{}' : json_encode($payload));
 
     $ch = curl_init($url);
     $headers = array(

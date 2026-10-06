@@ -2,16 +2,23 @@
 /**
  * PayNow.gg callback/webhook endpoint for WHMCS.
  *
- * Money flow (single source of truth = ON_ORDER_COMPLETED, which carries the order id and amounts):
- *  - first order of a checkout  -> pays the WHMCS invoice referenced in the checkout metadata
- *  - renewal order of a subscription -> pays the pending WHMCS renewal invoice of the service
- *    (or creates one linked to the service) so WHMCS never bills the renewal twice.
- * Subscription events only link / unlink the PayNow subscription id on the WHMCS service.
+ * Money flow (ON_ORDER_COMPLETED carries the order id and amounts and is the only event that books money):
+ *  - the checkout invoice is still unpaid      -> pay it
+ *  - the checkout invoice is already paid and the order belongs to a linked subscription
+ *    -> renewal: pay the pending renewal invoice of the service (or create one linked to the service)
+ * Subscription events only link / unlink the PayNow subscription id on the WHMCS service, after checking
+ * the real subscription status through the PayNow API.
+ *
+ * Anything that cannot be booked safely (currency mismatch, negative amount, duplicate payment, ...) is NOT
+ * guessed: it is written to the WHMCS Activity Log for manual review.
  */
 
 require_once __DIR__ . '/../../../init.php';
 require_once __DIR__ . '/../../../includes/gatewayfunctions.php';
 require_once __DIR__ . '/../../../includes/invoicefunctions.php';
+if (!function_exists('paynowgg_apiRequest')) {
+    require_once __DIR__ . '/../paynowgg.php';
+}
 
 $gatewayModuleName = basename(__FILE__, '.php');
 $gatewayParams = getGatewayVariables($gatewayModuleName);
@@ -56,6 +63,7 @@ logTransaction($gatewayParams['name'], $rawPayload, $eventType ?: 'PayNow Webhoo
 try {
     switch ($eventType) {
         case 'ON_ORDER_COMPLETED':
+            paynowgg_callback_lock();
             paynowgg_callback_handleOrderCompleted($gatewayModuleName, $gatewayParams, $body);
             http_response_code(200);
             echo 'OK';
@@ -63,12 +71,14 @@ try {
 
         case 'ON_SUBSCRIPTION_ACTIVATED':
         case 'ON_SUBSCRIPTION_RENEWED':
-            paynowgg_callback_linkSubscription($body);
+            paynowgg_callback_lock();
+            paynowgg_callback_linkSubscription($gatewayParams, $body);
             http_response_code(200);
             echo 'OK';
             break;
 
         case 'ON_SUBSCRIPTION_CANCELED':
+            paynowgg_callback_lock();
             paynowgg_callback_unlinkSubscription($body);
             http_response_code(200);
             echo 'OK';
@@ -76,7 +86,12 @@ try {
 
         case 'ON_REFUND':
         case 'ON_CHARGEBACK':
-            // WHMCS does not require an automatic reversal here. Logging the signed event keeps an audit trail.
+            // Not reversed automatically: a human must decide. Flag it in the Activity Log.
+            paynowgg_callback_report('Received ' . $eventType . ' - review the matching WHMCS transaction manually.', array(
+                'event_type' => $eventType,
+                'event_id' => $event['event_id'] ?? '',
+                'order_id' => $body['order_id'] ?? ($body['id'] ?? ''),
+            ));
             http_response_code(200);
             echo 'Logged';
             break;
@@ -116,12 +131,29 @@ function paynowgg_callback_validateSignature($rawPayload, $timestamp, $providedS
     return hash_equals($expected, $providedSignature);
 }
 
-function paynowgg_callback_lock($name)
+/**
+ * One global lock serialises every state-changing webhook (low volume, and it avoids relying on several
+ * named locks, which older MySQL releases silently drop). Failing to get it is an error: PayNow retries.
+ */
+function paynowgg_callback_lock()
 {
-    // Named MySQL lock, released automatically when the request ends. Serialises concurrent webhooks.
-    try {
-        \WHMCS\Database\Capsule::connection()->select('SELECT GET_LOCK(?, 20) AS l', array('paynowgg_' . substr(md5($name), 0, 32)));
-    } catch (\Throwable $e) {
+    $row = \WHMCS\Database\Capsule::connection()->selectOne('SELECT GET_LOCK(?, 25) AS l', array('paynowgg_webhook'));
+    $acquired = $row ? (int) ((array) $row)['l'] : 0;
+
+    if ($acquired !== 1) {
+        throw new Exception('Could not acquire the PayNow webhook lock.');
+    }
+}
+
+/**
+ * Writes to the module log and to the WHMCS Activity Log so an administrator sees what needs attention.
+ */
+function paynowgg_callback_report($message, array $context = array())
+{
+    logModuleCall('PayNow.gg', 'attention required', $context, array('message' => $message));
+
+    if (function_exists('logActivity')) {
+        logActivity('PayNow.gg: ' . $message . ' ' . json_encode($context));
     }
 }
 
@@ -137,22 +169,20 @@ function paynowgg_callback_firstMetadata(array $body)
 {
     $candidates = array(
         $body['checkout']['metadata'] ?? null,
-        $body['checkout']['lines'][0]['metadata'] ?? null,
         $body['order']['checkout']['lines'][0]['metadata'] ?? null,
         $body['lines'][0]['metadata'] ?? null,
     );
+
+    foreach ((array) ($body['checkout']['lines'] ?? array()) as $line) {
+        if (is_array($line)) {
+            $candidates[] = $line['metadata'] ?? null;
+        }
+    }
 
     $merged = array();
     foreach ($candidates as $meta) {
         if (is_array($meta)) {
             $merged = $merged + $meta;
-        }
-    }
-
-    // Metadata of every checkout line (the subscription link lives on the line, the invoice id on both).
-    foreach ((array) ($body['checkout']['lines'] ?? array()) as $line) {
-        if (is_array($line) && is_array($line['metadata'] ?? null)) {
-            $merged = $merged + $line['metadata'];
         }
     }
 
@@ -167,7 +197,7 @@ function paynowgg_callback_findSubscriptionIdInOrder(array $body)
         }
     }
 
-    return '';
+    return (string) ($body['subscription_id'] ?? '');
 }
 
 function paynowgg_callback_normalizeType($type)
@@ -203,26 +233,92 @@ function paynowgg_callback_findServiceBySubscription($subscriptionId)
     return null;
 }
 
-function paynowgg_callback_linkSubscription(array $body)
+function paynowgg_callback_api(array $gatewayParams, $method, $path, array $payload = null)
 {
-    $subscriptionId = (string) ($body['id'] ?? '');
-    if ($subscriptionId === '') {
-        return;
+    $apiBaseUrl = rtrim(trim((string) ($gatewayParams['apiBaseUrl'] ?: 'https://api.paynow.gg')), '/');
+
+    return paynowgg_apiRequest(
+        $apiBaseUrl,
+        trim((string) $gatewayParams['storeId']),
+        trim((string) $gatewayParams['apiKey']),
+        $method,
+        $path,
+        $payload,
+        !empty($gatewayParams['debugMode'])
+    );
+}
+
+/**
+ * Real subscription status from PayNow (created, active, past_due, canceled). Throws on API failure so the
+ * webhook is retried instead of acting on a guess.
+ */
+function paynowgg_callback_subscriptionStatus(array $gatewayParams, $subscriptionId)
+{
+    $subscription = paynowgg_callback_api($gatewayParams, 'GET', '/subscriptions/' . rawurlencode($subscriptionId));
+
+    return strtolower((string) ($subscription['status'] ?? ''));
+}
+
+/**
+ * Links a PayNow subscription to a WHMCS service.
+ * Returns: 'linked' | 'canceled' (stale event, nothing done) | 'duplicate' (service already has another live
+ * subscription: the new one is cancelled) | 'missing' (service not found).
+ */
+function paynowgg_callback_attachSubscription(array $gatewayParams, $type, $relid, $subscriptionId)
+{
+    $table = paynowgg_callback_table($type);
+    $row = \WHMCS\Database\Capsule::table($table)->where('id', '=', (int) $relid)->first();
+
+    if (!$row) {
+        return 'missing';
     }
 
+    $existing = (string) ($row->subscriptionid ?? '');
+    if ($existing === $subscriptionId) {
+        return 'linked';
+    }
+
+    if (paynowgg_callback_subscriptionStatus($gatewayParams, $subscriptionId) === 'canceled') {
+        return 'canceled';
+    }
+
+    if ($existing !== '' && paynowgg_callback_subscriptionStatus($gatewayParams, $existing) !== 'canceled') {
+        paynowgg_callback_report('Duplicate PayNow subscription detected, the new one is being cancelled. If the customer was charged twice, refund the extra order in PayNow.', array(
+            'service_type' => $type,
+            'service_id' => (int) $relid,
+            'kept_subscription' => $existing,
+            'duplicate_subscription' => $subscriptionId,
+        ));
+
+        try {
+            paynowgg_callback_api($gatewayParams, 'POST', '/subscriptions/' . rawurlencode($subscriptionId) . '/cancel', array());
+        } catch (Throwable $e) {
+            paynowgg_callback_report('Could not cancel the duplicate PayNow subscription automatically - cancel it in the PayNow dashboard.', array(
+                'duplicate_subscription' => $subscriptionId,
+                'error' => $e->getMessage(),
+            ));
+        }
+
+        return 'duplicate';
+    }
+
+    \WHMCS\Database\Capsule::table($table)->where('id', '=', (int) $relid)->update(array('subscriptionid' => $subscriptionId));
+
+    return 'linked';
+}
+
+function paynowgg_callback_linkSubscription(array $gatewayParams, array $body)
+{
+    $subscriptionId = (string) ($body['id'] ?? '');
     $metadata = paynowgg_callback_firstMetadata($body);
     $relid = (int) ($metadata['whmcs_subscription_relid'] ?? 0);
     $type = paynowgg_callback_normalizeType($metadata['whmcs_subscription_type'] ?? '');
 
-    if ($relid <= 0 || $type === '') {
+    if ($subscriptionId === '' || $relid <= 0 || $type === '') {
         return;
     }
 
-    paynowgg_callback_lock('sub' . $subscriptionId);
-
-    \WHMCS\Database\Capsule::table(paynowgg_callback_table($type))
-        ->where('id', '=', $relid)
-        ->update(array('subscriptionid' => $subscriptionId));
+    paynowgg_callback_attachSubscription($gatewayParams, $type, $relid, $subscriptionId);
 }
 
 function paynowgg_callback_unlinkSubscription(array $body)
@@ -232,9 +328,8 @@ function paynowgg_callback_unlinkSubscription(array $body)
         return;
     }
 
-    paynowgg_callback_lock('sub' . $subscriptionId);
-
-    // Cleared so the customer can pay the next invoice (or start a new subscription) normally.
+    // Only the service that points at this exact subscription is cleared, so the customer can pay the next
+    // invoice (or start a new subscription) normally.
     foreach (array('tblhosting', 'tblhostingaddons') as $table) {
         \WHMCS\Database\Capsule::table($table)
             ->where('subscriptionid', '=', $subscriptionId)
@@ -251,9 +346,6 @@ function paynowgg_callback_handleOrderCompleted($gatewayModuleName, array $gatew
         throw new Exception('Missing PayNow order id.');
     }
 
-    // Serialise per order so duplicate / concurrent deliveries cannot both record a payment.
-    paynowgg_callback_lock('order' . $transactionId);
-
     if (paynowgg_callback_transactionExists($transactionId)) {
         return;
     }
@@ -261,125 +353,213 @@ function paynowgg_callback_handleOrderCompleted($gatewayModuleName, array $gatew
     $metadata = paynowgg_callback_firstMetadata($body);
     $subscriptionId = paynowgg_callback_findSubscriptionIdInOrder($body);
     $invoiceId = (int) ($metadata['whmcs_invoice_id'] ?? 0);
+    $currency = strtoupper((string) ($body['currency'] ?? ''));
 
-    $currency = (string) ($body['currency'] ?? '');
-    $amount = isset($body['total_amount']) ? paynowgg_callback_fromMinorUnits((int) $body['total_amount'], $currency) : 0.0;
+    $paid = paynowgg_callback_fromMinorUnits((int) ($body['total_amount'] ?? 0), $currency);
     $fee = paynowgg_callback_fromMinorUnits(
         (int) ($body['gateway_fee_amount'] ?? 0) + (int) ($body['platform_fee_amount'] ?? 0),
         $currency
     );
+    $isFreeOrder = (int) ($body['discount_amount'] ?? 0) > 0
+        || (int) ($body['giftcard_usage_amount'] ?? 0) > 0
+        || !empty($body['applied_coupons'])
+        || !empty($body['applied_giftcards']);
 
-    // 1) Link the subscription to the service as soon as we can (first order of the checkout).
-    $relid = (int) ($metadata['whmcs_subscription_relid'] ?? 0);
-    $type = paynowgg_callback_normalizeType($metadata['whmcs_subscription_type'] ?? '');
-    if ($subscriptionId !== '' && $relid > 0 && $type !== '') {
-        \WHMCS\Database\Capsule::table(paynowgg_callback_table($type))
-            ->where('id', '=', $relid)
-            ->update(array('subscriptionid' => $subscriptionId));
-    }
-
-    // 2) Pay the invoice referenced by the checkout if it is still payable.
-    if ($invoiceId > 0) {
-        paynowgg_callback_lock('inv' . $invoiceId);
-        $invoice = localAPI('GetInvoice', array('invoiceid' => $invoiceId));
-
-        if (($invoice['result'] ?? '') === 'success' && ($invoice['status'] ?? '') === 'Unpaid') {
-            $payable = paynowgg_callback_payableAmount($invoice, $amount, $currency);
-            addInvoicePayment($invoiceId, $transactionId, $payable, $fee, $gatewayModuleName);
-            return;
-        }
-    }
-
-    // 3) Invoice already paid / missing: this is a renewal order of a subscription.
-    if ($subscriptionId !== '') {
-        paynowgg_callback_handleRenewalOrder($gatewayModuleName, $transactionId, $subscriptionId, $metadata, $amount, $fee, $body);
+    if ($invoiceId <= 0) {
+        paynowgg_callback_report('Order completed without whmcs_invoice_id metadata, nothing was booked.', array('order_id' => $transactionId));
         return;
     }
 
-    logModuleCall('PayNow.gg', 'order completed ignored', array(
-        'order_id' => $transactionId,
-        'invoice_id' => $invoiceId,
-    ), array('status' => 'invoice not payable and order is not a subscription renewal'));
+    // A failed lookup must be retried, never interpreted as "invoice already paid".
+    $invoice = localAPI('GetInvoice', array('invoiceid' => $invoiceId));
+    if (($invoice['result'] ?? '') !== 'success') {
+        throw new Exception('Could not load WHMCS invoice ' . $invoiceId . ': ' . json_encode($invoice));
+    }
+    $status = (string) ($invoice['status'] ?? '');
+
+    // Link the subscription first: if it fails the webhook is retried, and linking is idempotent.
+    $relid = (int) ($metadata['whmcs_subscription_relid'] ?? 0);
+    $type = paynowgg_callback_normalizeType($metadata['whmcs_subscription_type'] ?? '');
+    $attached = '';
+    if ($subscriptionId !== '' && $relid > 0 && $type !== '') {
+        $attached = paynowgg_callback_attachSubscription($gatewayParams, $type, $relid, $subscriptionId);
+    }
+
+    if ($status === 'Unpaid') {
+        $amount = paynowgg_callback_resolveAmount($invoice, $invoiceId, $paid, $currency, $isFreeOrder, $transactionId);
+        if ($amount === null) {
+            return;
+        }
+
+        addInvoicePayment($invoiceId, $transactionId, $amount, $fee, $gatewayModuleName);
+        return;
+    }
+
+    if ($subscriptionId === '') {
+        paynowgg_callback_report('Order completed for an invoice that is not payable (status ' . $status . '), nothing was booked. The customer may have been charged twice.', array(
+            'order_id' => $transactionId,
+            'invoice_id' => $invoiceId,
+            'amount' => $paid,
+            'currency' => $currency,
+        ));
+        return;
+    }
+
+    if ($attached === 'duplicate' || $attached === 'canceled') {
+        paynowgg_callback_report('Order belongs to a duplicate or cancelled subscription and the invoice is already ' . $status . '. Refund it in PayNow if the customer was charged.', array(
+            'order_id' => $transactionId,
+            'invoice_id' => $invoiceId,
+            'subscription_id' => $subscriptionId,
+            'amount' => $paid,
+            'currency' => $currency,
+        ));
+        return;
+    }
+
+    // Renewal order: the checkout invoice must be Paid, and it must have been paid through this gateway.
+    if ($status !== 'Paid' || !\WHMCS\Database\Capsule::table('tblaccounts')->where('invoiceid', '=', $invoiceId)->where('gateway', '=', 'paynowgg')->exists()) {
+        paynowgg_callback_report('Subscription order cannot be matched to a paid PayNow invoice (status ' . $status . '), nothing was booked.', array(
+            'order_id' => $transactionId,
+            'invoice_id' => $invoiceId,
+            'subscription_id' => $subscriptionId,
+        ));
+        return;
+    }
+
+    paynowgg_callback_handleRenewalOrder($gatewayModuleName, $transactionId, $subscriptionId, $paid, $fee, $currency, $isFreeOrder);
 }
 
 /**
- * Amount to record: never more than the invoice balance, and never trust a different-currency amount.
+ * Amount to book on an invoice, or null when it must not be booked automatically (reported to the admin).
+ * Currency is read from the invoice owner's WHMCS currency (GetInvoice does not return it).
  */
-function paynowgg_callback_payableAmount(array $invoice, $paidAmount, $paidCurrency)
+function paynowgg_callback_resolveAmount(array $invoice, $invoiceId, $paid, $paidCurrency, $isFreeOrder, $transactionId)
 {
-    $balance = isset($invoice['balance']) ? (float) $invoice['balance'] : (float) ($invoice['total'] ?? 0);
-    $invoiceCurrency = (string) ($invoice['currencycode'] ?? $invoice['currency'] ?? '');
+    $invoiceCurrency = paynowgg_callback_invoiceCurrencyCode($invoiceId);
+    $balance = round((float) ($invoice['balance'] ?? 0), 2);
+    $context = array(
+        'order_id' => $transactionId,
+        'invoice_id' => $invoiceId,
+        'paid' => $paid,
+        'paid_currency' => $paidCurrency,
+        'invoice_currency' => $invoiceCurrency,
+        'invoice_balance' => $balance,
+    );
 
-    $sameCurrency = $paidCurrency === '' || $invoiceCurrency === '' || strtoupper($paidCurrency) === strtoupper($invoiceCurrency);
+    if ($paidCurrency === '' || $invoiceCurrency === '' || $paidCurrency !== $invoiceCurrency) {
+        paynowgg_callback_report('Currency mismatch between the PayNow order and the WHMCS invoice, nothing was booked. Apply the payment manually.', $context);
+        return null;
+    }
 
-    if (!$sameCurrency) {
-        logModuleCall('PayNow.gg', 'currency mismatch detected', array(
-            'invoice_id' => $invoice['invoiceid'] ?? null,
-            'payment_currency' => $paidCurrency,
-            'payment_amount' => $paidAmount,
-            'invoice_currency' => $invoiceCurrency,
-            'balance' => $balance,
-        ), array('status' => 'using invoice balance'));
+    if ($balance <= 0) {
+        paynowgg_callback_report('Invoice has no balance left, nothing was booked.', $context);
+        return null;
+    }
 
+    if ($paid < 0) {
+        paynowgg_callback_report('Negative PayNow order amount, nothing was booked.', $context);
+        return null;
+    }
+
+    if ($paid == 0.0) {
+        if ($isFreeOrder) {
+            // 100% coupon / gift card order: the merchant explicitly made it free, settle the invoice.
+            return $balance;
+        }
+
+        paynowgg_callback_report('PayNow order amount is 0 without any discount, nothing was booked.', $context);
+        return null;
+    }
+
+    if ($paid > $balance + 0.005) {
+        paynowgg_callback_report('PayNow order is higher than the invoice balance. Only the balance was booked; refund the difference in PayNow.', $context);
         return $balance;
     }
 
-    if ($paidAmount <= 0 || $paidAmount > $balance) {
-        return $balance;
-    }
-
-    return $paidAmount;
+    return $paid;
 }
 
-function paynowgg_callback_handleRenewalOrder($gatewayModuleName, $transactionId, $subscriptionId, array $metadata, $amount, $fee, array $body)
+function paynowgg_callback_invoiceCurrencyCode($invoiceId)
 {
-    paynowgg_callback_lock('sub' . $subscriptionId);
+    $row = \WHMCS\Database\Capsule::table('tblinvoices')
+        ->join('tblclients', 'tblclients.id', '=', 'tblinvoices.userid')
+        ->join('tblcurrencies', 'tblcurrencies.id', '=', 'tblclients.currency')
+        ->where('tblinvoices.id', '=', (int) $invoiceId)
+        ->first(array('tblcurrencies.code as code'));
 
+    return $row ? strtoupper((string) $row->code) : '';
+}
+
+function paynowgg_callback_handleRenewalOrder($gatewayModuleName, $transactionId, $subscriptionId, $paid, $fee, $currency, $isFreeOrder)
+{
+    // Strict: the subscription must already be linked to a service (done by the first order / activation).
     $service = paynowgg_callback_findServiceBySubscription($subscriptionId);
-
     if (!$service) {
-        // Fall back on the metadata of the original checkout.
-        $type = paynowgg_callback_normalizeType($metadata['whmcs_subscription_type'] ?? '');
-        $relid = (int) ($metadata['whmcs_subscription_relid'] ?? 0);
-        if ($type !== '' && $relid > 0) {
-            $row = \WHMCS\Database\Capsule::table(paynowgg_callback_table($type))->where('id', '=', $relid)->first();
-            if ($row) {
-                $service = array('type' => $type, 'relid' => $relid, 'userid' => (int) $row->userid);
-            }
-        }
+        paynowgg_callback_report('Renewal order for a subscription that is not linked to any WHMCS service, nothing was booked.', array(
+            'order_id' => $transactionId,
+            'subscription_id' => $subscriptionId,
+            'amount' => $paid,
+            'currency' => $currency,
+        ));
+        return;
     }
 
-    if (!$service) {
-        throw new Exception('Renewal order ' . $transactionId . ': no WHMCS service linked to subscription ' . $subscriptionId);
+    if ($paid <= 0) {
+        paynowgg_callback_report('Renewal order with a zero or negative amount, nothing was booked.', array('order_id' => $transactionId, 'subscription_id' => $subscriptionId));
+        return;
     }
 
-    if ($amount <= 0) {
-        throw new Exception('Renewal order ' . $transactionId . ': invalid amount.');
-    }
-
-    $invoiceId = paynowgg_callback_findRenewalInvoice($service['userid'], $service['relid'], $service['type']);
+    $invoiceId = paynowgg_callback_findInvoiceByOrderMarker($transactionId);
     $created = false;
 
     if (!$invoiceId) {
-        $invoiceId = paynowgg_callback_createRenewalInvoice($service, $amount, $subscriptionId);
+        $invoiceId = paynowgg_callback_findRenewalInvoice($service['userid'], $service['relid'], $service['type']);
+    }
+
+    if (!$invoiceId) {
+        $invoiceId = paynowgg_callback_createRenewalInvoice($service, $paid, $subscriptionId, $transactionId);
         $created = true;
     }
 
-    paynowgg_callback_lock('inv' . $invoiceId);
+    // Idempotent: re-links the line item if a previous attempt created the invoice but failed afterwards.
+    paynowgg_callback_linkInvoiceItem($invoiceId, $service);
 
     $invoice = localAPI('GetInvoice', array('invoiceid' => $invoiceId));
-    $payable = paynowgg_callback_payableAmount($invoice, $amount, (string) ($body['currency'] ?? ''));
+    if (($invoice['result'] ?? '') !== 'success') {
+        throw new Exception('Could not load renewal invoice ' . $invoiceId . '.');
+    }
 
-    addInvoicePayment($invoiceId, $transactionId, $payable, $fee, $gatewayModuleName);
+    $amount = paynowgg_callback_resolveAmount($invoice, $invoiceId, $paid, $currency, $isFreeOrder, $transactionId);
+    if ($amount === null) {
+        return;
+    }
+
+    addInvoicePayment($invoiceId, $transactionId, $amount, $fee, $gatewayModuleName);
 
     logModuleCall('PayNow.gg', 'subscription renewal recorded', array(
         'invoice_id' => $invoiceId,
         'order_id' => $transactionId,
         'subscription_id' => $subscriptionId,
         'service' => $service,
-        'amount' => $payable,
+        'amount' => $amount,
         'invoice_created' => $created,
     ), array('status' => 'success'));
+}
+
+function paynowgg_callback_orderMarker($transactionId)
+{
+    return 'PayNow Order ' . $transactionId;
+}
+
+function paynowgg_callback_findInvoiceByOrderMarker($transactionId)
+{
+    $row = \WHMCS\Database\Capsule::table('tblinvoices')
+        ->where('status', '=', 'Unpaid')
+        ->where('notes', 'like', '%' . paynowgg_callback_orderMarker($transactionId) . ']%')
+        ->orderBy('id', 'asc')
+        ->first(array('id'));
+
+    return $row ? (int) $row->id : 0;
 }
 
 /**
@@ -388,13 +568,11 @@ function paynowgg_callback_handleRenewalOrder($gatewayModuleName, $transactionId
  */
 function paynowgg_callback_findRenewalInvoice($userId, $relid, $type)
 {
-    $itemType = $type === 'addon' ? 'Addon' : 'Hosting';
-
     $row = \WHMCS\Database\Capsule::table('tblinvoiceitems')
         ->join('tblinvoices', 'tblinvoices.id', '=', 'tblinvoiceitems.invoiceid')
         ->where('tblinvoices.userid', '=', (int) $userId)
         ->where('tblinvoices.status', '=', 'Unpaid')
-        ->where('tblinvoiceitems.type', '=', $itemType)
+        ->where('tblinvoiceitems.type', '=', $type === 'addon' ? 'Addon' : 'Hosting')
         ->where('tblinvoiceitems.relid', '=', (int) $relid)
         ->orderBy('tblinvoices.id', 'asc')
         ->first(array('tblinvoices.id as id'));
@@ -402,7 +580,15 @@ function paynowgg_callback_findRenewalInvoice($userId, $relid, $type)
     return $row ? (int) $row->id : 0;
 }
 
-function paynowgg_callback_createRenewalInvoice(array $service, $amount, $subscriptionId)
+function paynowgg_callback_linkInvoiceItem($invoiceId, array $service)
+{
+    \WHMCS\Database\Capsule::table('tblinvoiceitems')
+        ->where('invoiceid', '=', (int) $invoiceId)
+        ->where('relid', '=', 0)
+        ->update(array('type' => $service['type'] === 'addon' ? 'Addon' : 'Hosting', 'relid' => $service['relid']));
+}
+
+function paynowgg_callback_createRenewalInvoice(array $service, $amount, $subscriptionId, $transactionId)
 {
     $description = 'Subscription Renewal';
 
@@ -419,7 +605,7 @@ function paynowgg_callback_createRenewalInvoice(array $service, $amount, $subscr
         }
     }
 
-    // Single call with its line item: never leaves a blank invoice behind.
+    // The order marker in the notes lets a retry find this invoice instead of creating another one.
     $result = localAPI('CreateInvoice', array(
         'userid' => $service['userid'],
         'date' => date('Y-m-d'),
@@ -429,21 +615,14 @@ function paynowgg_callback_createRenewalInvoice(array $service, $amount, $subscr
         'itemdescription1' => $description,
         'itemamount1' => $amount,
         'itemtaxed1' => 0,
-        'notes' => 'PayNow Subscription Renewal (ID: ' . $subscriptionId . ')',
+        'notes' => '[' . paynowgg_callback_orderMarker($transactionId) . '] PayNow Subscription Renewal (ID: ' . $subscriptionId . ')',
     ));
 
     if (empty($result['invoiceid'])) {
         throw new Exception('Failed to create renewal invoice: ' . json_encode($result));
     }
 
-    $invoiceId = (int) $result['invoiceid'];
-
-    // Link the item to the service so WHMCS advances the next due date and does not invoice it again.
-    \WHMCS\Database\Capsule::table('tblinvoiceitems')
-        ->where('invoiceid', '=', $invoiceId)
-        ->update(array('type' => $service['type'] === 'addon' ? 'Addon' : 'Hosting', 'relid' => $service['relid']));
-
-    return $invoiceId;
+    return (int) $result['invoiceid'];
 }
 
 function paynowgg_callback_fromMinorUnits($amount, $currencyCode)
