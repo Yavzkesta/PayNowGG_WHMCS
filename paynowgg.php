@@ -379,13 +379,24 @@ function paynowgg_detectSubscription(array $params, $allowSubscriptions)
     );
 }
 
+function paynowgg_isPayNowSubscriptionId($id)
+{
+    // PayNow flake ids are long numeric strings; other gateways (PayPal "I-...", Tebex "tbx-...") are not.
+    return preg_match('/^\d{15,22}$/', (string) $id) === 1;
+}
+
 function paynowgg_hasActiveSubscription($invoiceId)
 {
     try {
         $items = \WHMCS\Database\Capsule::table('tblinvoiceitems')->where('invoiceid', (int) $invoiceId)->get();
         foreach ($items as $item) {
             $table = $item->type === 'Hosting' ? 'tblhosting' : ($item->type === 'Addon' ? 'tblhostingaddons' : null);
-            if ($table && (int) $item->relid > 0 && \WHMCS\Database\Capsule::table($table)->where('id', (int) $item->relid)->value('subscriptionid')) {
+            if (!$table || (int) $item->relid <= 0) {
+                continue;
+            }
+
+            $subscriptionId = \WHMCS\Database\Capsule::table($table)->where('id', (int) $item->relid)->value('subscriptionid');
+            if (paynowgg_isPayNowSubscriptionId($subscriptionId)) {
                 return true;
             }
         }

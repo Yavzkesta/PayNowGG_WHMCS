@@ -260,9 +260,19 @@ function paynowgg_callback_subscriptionStatus(array $gatewayParams, $subscriptio
 }
 
 /**
+ * PayNow flake ids are long numeric strings. The WHMCS subscriptionid field is shared between gateways
+ * (PayPal "I-...", Tebex "tbx-...", ...), so anything not flake-shaped belongs to another gateway.
+ */
+function paynowgg_callback_isFlakeId($id)
+{
+    return preg_match('/^\d{15,22}$/', (string) $id) === 1;
+}
+
+/**
  * Links a PayNow subscription to a WHMCS service.
  * Returns: 'linked' | 'canceled' (stale event, nothing done) | 'duplicate' (service already has another live
- * subscription: the new one is cancelled) | 'missing' (service not found).
+ * subscription: the new one is cancelled) | 'foreign' (another gateway owns the subscription id, never touched)
+ * | 'missing' (service not found).
  */
 function paynowgg_callback_attachSubscription(array $gatewayParams, $type, $relid, $subscriptionId)
 {
@@ -280,6 +290,18 @@ function paynowgg_callback_attachSubscription(array $gatewayParams, $type, $reli
 
     if (paynowgg_callback_subscriptionStatus($gatewayParams, $subscriptionId) === 'canceled') {
         return 'canceled';
+    }
+
+    // Never overwrite or probe a subscription id that belongs to another gateway.
+    if ($existing !== '' && !paynowgg_callback_isFlakeId($existing)) {
+        paynowgg_callback_report('Service already has a subscription id from another gateway - not overwritten. Check for a double billing setup.', array(
+            'service_type' => $type,
+            'service_id' => (int) $relid,
+            'existing_subscription' => $existing,
+            'paynow_subscription' => $subscriptionId,
+        ));
+
+        return 'foreign';
     }
 
     if ($existing !== '' && paynowgg_callback_subscriptionStatus($gatewayParams, $existing) !== 'canceled') {
@@ -405,7 +427,7 @@ function paynowgg_callback_handleOrderCompleted($gatewayModuleName, array $gatew
         return;
     }
 
-    if ($attached === 'duplicate' || $attached === 'canceled') {
+    if ($attached === 'duplicate' || $attached === 'canceled' || $attached === 'foreign') {
         paynowgg_callback_report('Order belongs to a duplicate or cancelled subscription and the invoice is already ' . $status . '. Refund it in PayNow if the customer was charged.', array(
             'order_id' => $transactionId,
             'invoice_id' => $invoiceId,
@@ -472,7 +494,7 @@ function paynowgg_callback_resolveAmount(array $invoice, $invoiceId, $paid, $pai
     }
 
     if ($paid > $balance + 0.005) {
-        paynowgg_callback_report('PayNow order is higher than the invoice balance. Only the balance was booked; refund the difference in PayNow.', $context);
+        paynowgg_callback_report('PayNow order is higher than the invoice balance. Only the balance was booked. This is usually the tax/VAT collected by PayNow (merchant of record) - it is normal and must NOT be refunded.', $context);
         return $balance;
     }
 
